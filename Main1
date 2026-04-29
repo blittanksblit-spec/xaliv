@@ -1,0 +1,710 @@
+import asyncio
+import random
+import logging
+import time
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    LabeledPrice, PreCheckoutQuery,
+)
+from aiogram.filters import Command, CommandObject
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.exceptions import TelegramBadRequest
+
+from database import (
+    init_db, get_balance, update_balance, get_ton_balance,
+    set_referrer, get_referral_count, get_last_free_case, set_last_free_case,
+    get_total_users, get_total_stars, get_total_ton, reset_all_stars,
+    reset_all_ton, reset_all_balances, get_bot_balance, update_bot_balance,
+    ban_user, unban_user, is_user_banned, add_deposit, get_total_deposited,
+    get_last_daily_bonus, set_last_daily_bonus, get_top_donators,
+    add_gift_to_inventory, remove_gift_from_inventory, get_inventory,
+    has_withdrawn_first_gift, set_first_gift_withdrawn,
+    create_promo, get_promo_by_code, has_activated_promo, activate_promo,
+)
+
+# --- НАСТРОЙКИ ---
+TOKEN = "8112779040:AAEWNnC0Yuj0OM7wr-NARl51BUQP-NpDveA"
+ADMIN_ID = 5350902324
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+router = Router()
+
+GIFT_INFO = {
+    "🧸 Мишка": {"id": "5170233102089322756", "win_price": 15, "withdraw_price": 20},
+    "💖 Сердечко": {"id": "5170145012310081615", "win_price": 15, "withdraw_price": 20},
+    "🌹 Роза": {"id": "5168103777563050263", "win_price": 25, "withdraw_price": 32},
+    "🎁 Подарок": {"id": "5170250947678437525", "win_price": 25, "withdraw_price": 32},
+    "🍰 Торт": {"id": "5170144170496491616", "win_price": 50, "withdraw_price": 60},
+    "💐 Букет": {"id": "5170314324215857265", "win_price": 50, "withdraw_price": 60},
+    "🚀 Ракета": {"id": "5170564780938756245", "win_price": 50, "withdraw_price": 60},
+    "💍 Кольцо": {"id": "5170690322832818290", "win_price": 100, "withdraw_price": 120},
+}
+
+class PaymentState(StatesGroup):
+    waiting_for_stars_amount = State()
+
+class GiftFriendState(StatesGroup):
+    waiting_for_friend_id = State()
+    waiting_for_amount = State()
+
+class CrashState(StatesGroup):
+    waiting_for_bet = State()
+    waiting_for_cashout = State()
+
+class GuessState(StatesGroup):
+    waiting_for_bet = State()
+    waiting_for_number = State()
+
+class PromoState(StatesGroup):
+    waiting_for_code = State()
+
+class CreatePromoState(StatesGroup):
+    waiting_for_code = State()
+    waiting_for_type = State()
+    waiting_for_stars = State()
+    waiting_for_gift = State()
+    waiting_for_max_uses = State()
+
+active_crash_games = {}
+
+async def safe_edit_text(message, text, reply_markup=None, parse_mode=None):
+    try:
+        await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
+
+async def check_banned_callback(callback: CallbackQuery):
+    if await is_user_banned(callback.from_user.id):
+        await callback.answer("⛔ Вы заблокированы!", show_alert=True)
+        return True
+    return False
+
+async def send_gift_to_user(bot: Bot, user_id: int, gift_name: str, user_name: str = ""):
+    if gift_name not in GIFT_INFO:
+        return False
+    gift_data = GIFT_INFO[gift_name]
+    gift_id = gift_data["id"]
+    gift_price = gift_data["win_price"]
+    bot_balance = await get_bot_balance()
+    if bot_balance < gift_price:
+        return False
+    try:
+        await update_bot_balance(-gift_price)
+        gift_text = f"🎁 Подарок от {user_name}: {gift_name}!" if user_name else f"🎁 Вы получили подарок: {gift_name}!"
+        await bot.send_gift(user_id=user_id, gift_id=gift_id, pay_for_upgrade=False, text=gift_text)
+        return True
+    except Exception as e:
+        await update_bot_balance(gift_price)
+        logger.error(f"Ошибка отправки подарка: {e}")
+        return False
+
+def main_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎮 Игры", callback_data="menu_games"),
+         InlineKeyboardButton(text="🎁 Кейсы", callback_data="menu_cases")],
+        [InlineKeyboardButton(text="💳 Пополнить", callback_data="menu_pay"),
+         InlineKeyboardButton(text="🎁 Вывод подарков", callback_data="menu_withdraw_gifts")],
+        [InlineKeyboardButton(text="🎒 Инвентарь", callback_data="menu_inventory"),
+         InlineKeyboardButton(text="👤 Мой профиль", callback_data="my_profile")],
+        [InlineKeyboardButton(text="🏆 ТОП", callback_data="top_donators"),
+         InlineKeyboardButton(text="🎁 Ежедневный бонус", callback_data="daily_bonus")],
+    ])
+
+# --- КОМАНДЫ ---
+@router.message(Command("start"))
+async def start(message: Message, command: CommandObject, state: FSMContext, bot: Bot):
+    await state.clear()
+    user_id = message.from_user.id
+    if await is_user_banned(user_id):
+        return await message.answer("⛔ Вы заблокированы в этом боте.")
+    args = command.args
+    if args and args.startswith("ref"):
+        try:
+            referrer_id = int(args[3:])
+            if referrer_id != user_id:
+                await set_referrer(user_id, referrer_id)
+        except:
+            pass
+    await message.answer("🏠 Добро пожаловать в VladoCasino!", reply_markup=main_kb())
+
+@router.message(Command("ban"))
+async def cmd_ban(message: Message):
+    if message.from_user.id != ADMIN_ID: return await message.answer("⛔ Нет доступа.")
+    args = message.text.split()
+    if len(args) != 2: return await message.answer("❌ Формат: /ban <user_id>")
+    try: target_id = int(args[1])
+    except ValueError: return await message.answer("❌ ID должен быть числом.")
+    await ban_user(target_id)
+    await message.answer(f"✅ Пользователь <code>{target_id}</code> забанен.", parse_mode="HTML")
+
+@router.message(Command("unban"))
+async def cmd_unban(message: Message):
+    if message.from_user.id != ADMIN_ID: return await message.answer("⛔ Нет доступа.")
+    args = message.text.split()
+    if len(args) != 2: return await message.answer("❌ Формат: /unban <user_id>")
+    try: target_id = int(args[1])
+    except ValueError: return await message.answer("❌ ID должен быть числом.")
+    await unban_user(target_id)
+    await message.answer(f"✅ Пользователь <code>{target_id}</code> разбанен.", parse_mode="HTML")
+
+@router.message(Command("addstarsbot"))
+async def cmd_add_stars_bot(message: Message):
+    if message.from_user.id != ADMIN_ID: return await message.answer("⛔ Нет доступа.")
+    args = message.text.split()
+    if len(args) != 2: return await message.answer("❌ Формат: /addstarsbot <количество>")
+    try: amount = int(args[1])
+    except ValueError: return await message.answer("❌ Количество должно быть числом.")
+    if amount <= 0: return await message.answer("❌ Количество должно быть положительным.")
+    await update_bot_balance(amount)
+    await message.answer(f"✅ Баланс бота пополнен на {amount} ⭐.\nТекущий баланс: {await get_bot_balance()} ⭐")
+
+@router.message(Command("botbalance"))
+async def cmd_bot_balance(message: Message):
+    if message.from_user.id != ADMIN_ID: return await message.answer("⛔ Нет доступа.")
+    await message.answer(f"💰 Баланс бота: {await get_bot_balance()} ⭐")
+
+@router.message(Command("add"))
+async def cmd_add_stars(message: Message):
+    if message.from_user.id != ADMIN_ID: return await message.answer("⛔ Нет доступа.")
+    args = message.text.split()
+    if len(args) != 3: return await message.answer("❌ Формат: /add <user_id> <количество>")
+    try:
+        target_id = int(args[1])
+        amount = int(args[2])
+    except ValueError: return await message.answer("❌ ID и количество должны быть числами.")
+    if amount <= 0: return await message.answer("❌ Количество должно быть положительным.")
+    await update_balance(target_id, amount)
+    await message.answer(f"✅ Пользователю <code>{target_id}</code> начислено {amount} ⭐.", parse_mode="HTML")
+
+@router.message(Command("static"))
+async def cmd_static(message: Message):
+    if message.from_user.id != ADMIN_ID: return await message.answer("⛔ Нет доступа.")
+    text = (
+        f"📊 <b>Статистика бота:</b>\n"
+        f"👥 Всего пользователей: <b>{await get_total_users()}</b>\n"
+        f"⭐ Суммарно звёзд: <b>{await get_total_stars()}</b>\n"
+        f"💎 Суммарно TON: <b>{await get_total_ton():.2f}</b>\n"
+        f"🤖 Баланс бота: <b>{await get_bot_balance()}</b> ⭐"
+    )
+    await message.answer(text, parse_mode="HTML")
+
+@router.message(Command("resetstars"))
+async def cmd_reset_stars(message: Message):
+    if message.from_user.id != ADMIN_ID: return await message.answer("⛔ Нет доступа.")
+    args = message.text.split()
+    if len(args) != 2 or args[1] != "confirm":
+        return await message.answer("⚠️ Введите /resetstars confirm для подтверждения.", parse_mode="HTML")
+    await reset_all_stars()
+    await message.answer("✅ Баланс звёзд у всех пользователей обнулён.")
+
+@router.message(Command("resetton"))
+async def cmd_reset_ton(message: Message):
+    if message.from_user.id != ADMIN_ID: return await message.answer("⛔ Нет доступа.")
+    args = message.text.split()
+    if len(args) != 2 or args[1] != "confirm":
+        return await message.answer("⚠️ Введите /resetton confirm для подтверждения.", parse_mode="HTML")
+    await reset_all_ton()
+    await message.answer("✅ Баланс TON у всех пользователей обнулён.")
+
+@router.message(Command("resetall"))
+async def cmd_reset_all(message: Message):
+    if message.from_user.id != ADMIN_ID: return await message.answer("⛔ Нет доступа.")
+    args = message.text.split()
+    if len(args) != 2 or args[1] != "confirm":
+        return await message.answer("⚠️ Введите /resetall confirm для подтверждения.", parse_mode="HTML")
+    await reset_all_balances()
+    await message.answer("✅ Балансы звёзд и TON у всех пользователей обнулены.")
+
+@router.message(Command("listgifts"))
+async def cmd_list_gifts(message: Message, bot: Bot):
+    if message.from_user.id != ADMIN_ID: return await message.answer("⛔ Нет доступа.")
+    try:
+        gifts = await bot.get_available_gifts()
+        if not gifts or not gifts.gifts: return await message.answer("❌ Не удалось получить список подарков.")
+        text = "🎁 <b>Актуальные подарки:</b>\n\n"
+        for gift in gifts.gifts[:20]:
+            text += f"Эмодзи: {gift.sticker.emoji or '—'}\nID: <code>{gift.id}</code>\nЦена: {gift.star_count} ⭐\n—\n"
+        await message.answer(text, parse_mode="HTML")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
+# --- ПРОМОКОДЫ ---
+@router.message(Command("createpromo"))
+async def create_promo_start(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID: return await message.answer("⛔ Нет доступа.")
+    await message.answer("🎟️ Введите код промокода (латинские буквы и цифры):")
+    await state.set_state(CreatePromoState.waiting_for_code)
+
+@router.message(CreatePromoState.waiting_for_code)
+async def create_promo_code(message: Message, state: FSMContext):
+    code = message.text.strip().upper()
+    if not code.isalnum():
+        return await message.answer("❌ Код должен содержать только буквы и цифры. Попробуйте ещё раз.")
+    existing = await get_promo_by_code(code)
+    if existing:
+        return await message.answer("❌ Такой промокод уже существует. Введите другой.")
+    await state.update_data(code=code)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐ Звёзды", callback_data="promo_type_stars")],
+        [InlineKeyboardButton(text="🎁 Подарок", callback_data="promo_type_gift")],
+    ])
+    await message.answer("Выберите тип награды:", reply_markup=kb)
+    await state.set_state(CreatePromoState.waiting_for_type)
+
+@router.callback_query(CreatePromoState.waiting_for_type, F.data.startswith("promo_type_"))
+async def create_promo_type(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID: return await callback.answer("⛔ Нет доступа.")
+    reward_type = callback.data.replace("promo_type_", "")
+    await state.update_data(reward_type=reward_type)
+    await callback.message.delete()
+    if reward_type == "stars":
+        await callback.message.answer("⭐ Введите количество звёзд (целое число):")
+        await state.set_state(CreatePromoState.waiting_for_stars)
+    else:
+        buttons = [[InlineKeyboardButton(text=g, callback_data=f"promo_gift_{g}")] for g in GIFT_INFO]
+        await callback.message.answer("🎁 Выберите подарок:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        await state.set_state(CreatePromoState.waiting_for_gift)
+    await callback.answer()
+
+@router.message(CreatePromoState.waiting_for_stars)
+async def create_promo_stars(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ Введите целое число.")
+    amount = int(message.text)
+    if amount <= 0: return await message.answer("❌ Количество должно быть положительным.")
+    await state.update_data(reward_amount=amount, reward_gift="")
+    await message.answer("👥 Введите максимальное количество активаций (целое число):")
+    await state.set_state(CreatePromoState.waiting_for_max_uses)
+
+@router.callback_query(CreatePromoState.waiting_for_gift, F.data.startswith("promo_gift_"))
+async def create_promo_gift(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID: return await callback.answer("⛔ Нет доступа.")
+    gift_name = callback.data.replace("promo_gift_", "")
+    await state.update_data(reward_amount=0, reward_gift=gift_name)
+    await callback.message.delete()
+    await callback.message.answer("👥 Введите максимальное количество активаций (целое число):")
+    await state.set_state(CreatePromoState.waiting_for_max_uses)
+    await callback.answer()
+
+@router.message(CreatePromoState.waiting_for_max_uses)
+async def create_promo_max_uses(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ Введите целое число.")
+    max_uses = int(message.text)
+    if max_uses <= 0: return await message.answer("❌ Количество должно быть положительным.")
+    data = await state.get_data()
+    await create_promo(data["code"], data["reward_type"], data.get("reward_amount", 0), data.get("reward_gift", ""), max_uses, ADMIN_ID)
+    await message.answer(
+        f"✅ Промокод <b>{data['code']}</b> создан!\n"
+        f"Тип: {'⭐ Звёзды' if data['reward_type'] == 'stars' else '🎁 Подарок'}\n"
+        f"Награда: {data.get('reward_amount') or data.get('reward_gift')}\n"
+        f"Лимит активаций: {max_uses}",
+        parse_mode="HTML"
+    )
+    await state.clear()
+
+@router.callback_query(F.data == "promo_enter")
+async def promo_enter(callback: CallbackQuery, state: FSMContext):
+    if await check_banned_callback(callback): return
+    await callback.message.answer("🎟️ Введите промокод:")
+    await state.set_state(PromoState.waiting_for_code)
+    await callback.answer()
+
+@router.message(PromoState.waiting_for_code)
+async def promo_activate(message: Message, state: FSMContext, bot: Bot):
+    code = message.text.strip().upper()
+    uid = message.from_user.id
+    promo = await get_promo_by_code(code)
+    if not promo:
+        await message.answer("❌ Промокод не найден или недействителен.")
+        await state.clear()
+        return
+    if promo["used_count"] >= promo["max_uses"]:
+        await message.answer("❌ Промокод больше не действителен.")
+        await state.clear()
+        return
+    if await has_activated_promo(uid, promo["id"]):
+        await message.answer("❌ Вы уже активировали этот промокод.")
+        await state.clear()
+        return
+    await activate_promo(uid, promo["id"])
+    if promo["reward_type"] == "stars":
+        await update_balance(uid, promo["reward_amount"])
+        await message.answer(f"✅ Промокод активирован! Вы получили {promo['reward_amount']} ⭐.")
+    elif promo["reward_type"] == "gift":
+        await add_gift_to_inventory(uid, promo["reward_gift"])
+        await message.answer(f"✅ Промокод активирован! Подарок «{promo['reward_gift']}» добавлен в инвентарь.")
+        await bot.send_message(ADMIN_ID, f"🎟️ Пользователь <a href='tg://user?id={uid}'>{message.from_user.first_name}</a> активировал промокод {code} – {promo['reward_gift']}", parse_mode="HTML")
+    await state.clear()
+
+# --- CALLBACK-ОБРАБОТЧИКИ ---
+@router.callback_query(F.data == "menu_main")
+async def go_main(callback: CallbackQuery, state: FSMContext):
+    if await check_banned_callback(callback): return
+    await state.clear()
+    await safe_edit_text(callback.message, "🏠 Главное меню:", reply_markup=main_kb())
+    await callback.answer()
+
+@router.callback_query(F.data == "my_profile")
+async def show_profile(callback: CallbackQuery):
+    if await check_banned_callback(callback): return
+    user_id = callback.from_user.id
+    text = (
+        f"👤 <b>Профиль: {callback.from_user.first_name}</b>\n\n"
+        f"🆔 ID: <code>{user_id}</code>\n"
+        f"💰 Баланс звёзд: {await get_balance(user_id)} ⭐\n"
+        f"👥 Приглашено друзей: {await get_referral_count(user_id)}\n"
+        f"💳 Пополнено через Stars: {await get_total_deposited(user_id)} ⭐"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Моя реферальная ссылка", callback_data="ref_link")],
+        [InlineKeyboardButton(text="🎟️ Промокоды", callback_data="promo_enter")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_main")],
+    ])
+    await safe_edit_text(callback.message, text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+@router.callback_query(F.data == "ref_link")
+async def show_ref_link(callback: CallbackQuery):
+    me = await callback.bot.get_me()
+    link = f"https://t.me/{me.username}?start=ref{callback.from_user.id}"
+    await callback.message.answer(f"🔗 <b>Ваша реферальная ссылка:</b>\n<code>{link}</code>", parse_mode="HTML")
+    await callback.answer()
+
+@router.callback_query(F.data == "daily_bonus")
+async def daily_bonus(callback: CallbackQuery):
+    if await check_banned_callback(callback): return
+    uid = callback.from_user.id
+    last = await get_last_daily_bonus(uid)
+    now = int(time.time())
+    if now - last < 86400:
+        remaining = 86400 - (now - last)
+        await callback.answer(f"❌ Бонус раз в 24ч. Осталось {remaining//3600}ч {(remaining%3600)//60}мин.", show_alert=True)
+        return
+    bonus = random.randint(1, 10)
+    await update_balance(uid, bonus)
+    await set_last_daily_bonus(uid, now)
+    await callback.answer(f"✅ Вы получили {bonus} ⭐!", show_alert=True)
+    await callback.answer()
+
+# --- ИГРЫ ---
+GAMES = [
+    {"name": "🎲 Кубик", "emoji": "🎲", "id": "game_dice"},
+    {"name": "🎯 Дартс", "emoji": "🎯", "id": "game_darts"},
+    {"name": "🎰 Слоты", "emoji": "🎰", "id": "game_slots"},
+    {"name": "📈 Краш", "emoji": "📈", "id": "game_crash"},
+    {"name": "🔢 Угадай число", "emoji": "🔢", "id": "game_guess"},
+]
+
+@router.callback_query(F.data == "menu_games")
+async def menu_games(callback: CallbackQuery):
+    if await check_banned_callback(callback): return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=g["name"], callback_data=g["id"])] for g in GAMES
+    ] + [[InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_main")]])
+    await safe_edit_text(callback.message, "🎮 Во что играем? (Ставка 5⭐ для обычных игр)", reply_markup=kb)
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("game_"))
+async def play_game(callback: CallbackQuery, state: FSMContext):
+    if await check_banned_callback(callback): return
+    uid = callback.from_user.id
+    game_id = callback.data
+    game = next(g for g in GAMES if g["id"] == game_id)
+    if game["id"] == "game_crash":
+        await callback.message.answer("📈 <b>Краш-игра</b>\nВведите ставку в звёздах (минимум 5⭐):", parse_mode="HTML")
+        await state.set_state(CrashState.waiting_for_bet)
+        await callback.answer()
+        return
+    if game["id"] == "game_guess":
+        await callback.message.answer("🔢 <b>Угадай число от 1 до 5</b>\nВведите ставку (минимум 5⭐):", parse_mode="HTML")
+        await state.set_state(GuessState.waiting_for_bet)
+        await callback.answer()
+        return
+    if uid != ADMIN_ID:
+        if await get_balance(uid) < 5: return await callback.answer("❌ Не хватает звёзд!", show_alert=True)
+        await update_balance(uid, -5)
+    msg = await callback.message.answer_dice(emoji=game["emoji"])
+    await asyncio.sleep(4)
+    value = msg.dice.value
+    win_amount = 0
+    if game["emoji"] == "🎲" and value >= 4: win_amount = 10
+    elif game["emoji"] == "🎯":
+        if value == 6: win_amount = 15
+        elif value >= 4: win_amount = 7
+    elif game["emoji"] == "🎰":
+        if value == 6: win_amount = 50
+        elif value == 5: win_amount = 20
+        elif value == 4: win_amount = 10
+    if win_amount > 0:
+        await update_balance(uid, win_amount)
+        await callback.message.answer(f"🎉 Победа! +{win_amount}⭐")
+    else:
+        await callback.message.answer("😞 К сожалению, проигрыш...")
+    await callback.answer()
+
+# --- КРАШ ---
+@router.message(CrashState.waiting_for_bet)
+async def crash_bet(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    if await is_user_banned(uid): await state.clear(); return await message.answer("⛔ Вы заблокированы.")
+    try: bet = int(message.text); assert bet >= 5
+    except: return await message.answer("❌ Введите целое число не менее 5!")
+    if await get_balance(uid) < bet: await state.clear(); return await message.answer("❌ Недостаточно звёзд!")
+    await update_balance(uid, -bet)
+    crash_point = round(random.uniform(1.0, 10.0), 2)
+    active_crash_games[uid] = {"bet": bet, "multiplier": 1.0, "crash_point": crash_point, "active": True}
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💰 Забрать", callback_data="crash_cashout")]])
+    await message.answer(f"📈 <b>Краш-игра началась!</b>\nСтавка: {bet} ⭐\nТекущий множитель: <b>1.00x</b>\n\nНажимайте «Забрать», пока не крашнулось!", parse_mode="HTML", reply_markup=kb)
+    await state.clear()
+
+@router.callback_query(F.data == "crash_cashout")
+async def crash_cashout(callback: CallbackQuery):
+    uid = callback.from_user.id
+    if uid not in active_crash_games or not active_crash_games[uid]["active"]:
+        return await callback.answer("❌ Игра не найдена или уже завершена!", show_alert=True)
+    game = active_crash_games[uid]
+    game["active"] = False
+    win_amount = int(game["bet"] * game["multiplier"])
+    await update_balance(uid, win_amount)
+    await callback.message.edit_text(f"✅ <b>Вы забрали выигрыш!</b>\nСтавка: {game['bet']} ⭐\nМножитель: {game['multiplier']:.2f}x\nВыигрыш: <b>{win_amount} ⭐</b>", parse_mode="HTML")
+    del active_crash_games[uid]
+    await callback.answer()
+
+# --- УГАДАЙ ЧИСЛО ---
+@router.message(GuessState.waiting_for_bet)
+async def guess_bet(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    if await is_user_banned(uid): await state.clear(); return await message.answer("⛔ Вы заблокированы.")
+    try: bet = int(message.text); assert bet >= 5
+    except: return await message.answer("❌ Введите целое число не менее 5!")
+    if await get_balance(uid) < bet: await state.clear(); return await message.answer("❌ Недостаточно звёзд!")
+    await update_balance(uid, -bet)
+    await state.update_data(bet=bet)
+    await message.answer("🔢 Введите число от 1 до 5:")
+    await state.set_state(GuessState.waiting_for_number)
+
+@router.message(GuessState.waiting_for_number)
+async def guess_number(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    data = await state.get_data()
+    bet = data["bet"]
+    try: guess = int(message.text); assert 1 <= guess <= 5
+    except: return await message.answer("❌ Введите число от 1 до 5!")
+    secret = random.randint(1, 5)
+    if guess == secret:
+        win = bet * 2
+        await update_balance(uid, win)
+        await message.answer(f"🎉 Поздравляем! Вы угадали число {secret} и выиграли {win} ⭐!")
+    else:
+        await message.answer(f"😞 К сожалению, вы не угадали. Было число {secret}.")
+    await state.clear()
+
+# --- КЕЙСЫ С АНИМАЦИЕЙ ---
+CASES = {
+    "free": {"name": "🆓 Халявный (24ч)", "cost": 0, "items": ["⭐ 3", "💨 Пусто", "🧸 Мишка"], "weights": [45, 50, 5]},
+    "case_1": {"name": "📦 Бомж (3⭐)", "cost": 3, "items": ["⭐ 10", "⭐ 5", "💨 Пусто", "🧸 Мишка", "💖 Сердечко"], "weights": [20, 25, 50, 4, 1]},
+    "case_2": {"name": "🥉 Бронзовый (15⭐)", "cost": 15, "items": ["⭐ 25", "⭐ 20", "💨 Пусто", "🌹 Роза", "🎁 Подарок"], "weights": [15, 20, 60, 3, 2]},
+    "case_3": {"name": "🥈 Серебряный (50⭐)", "cost": 50, "items": ["⭐ 80", "⭐ 75", "💨 Пусто", "🍰 Торт", "💐 Букет", "🚀 Ракета"], "weights": [15, 15, 65, 2, 2, 1]},
+    "case_4": {"name": "🥇 Золотой (100⭐)", "cost": 100, "items": ["⭐ 150", "⭐ 120", "💨 Пусто", "💍 Кольцо"], "weights": [20, 20, 55, 5]},
+    "case_5": {"name": "💎 Бриллиантовый (250⭐)", "cost": 250, "items": ["⭐ 400", "⭐ 300", "💨 Пусто", "💍 Кольцо", "🚀 Ракета"], "weights": [20, 20, 55, 3, 2]},
+    "case_6": {"name": "🔥 Олигарх (1000⭐)", "cost": 1000, "items": ["⭐ 1500", "⭐ 1200", "💨 Пусто", "💍 Кольцо", "🍰 Торт"], "weights": [25, 20, 50, 3, 2]},
+}
+
+async def animate_case_opening(msg, items):
+    for _ in range(12):
+        emoji = random.choice(items)
+        await safe_edit_text(msg, f"🎲 {emoji}")
+        await asyncio.sleep(0.1)
+
+@router.callback_query(F.data == "menu_cases")
+async def menu_cases(callback: CallbackQuery):
+    if await check_banned_callback(callback): return
+    buttons = [[InlineKeyboardButton(text=c["name"], callback_data=f"c_{k}")] for k, c in CASES.items()]
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_main")])
+    await safe_edit_text(callback.message, "🎁 Выберите кейс:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("c_"))
+async def open_case(callback: CallbackQuery, bot: Bot):
+    if await check_banned_callback(callback): return
+    key = callback.data.replace("c_", "")
+    case = CASES[key]
+    uid = callback.from_user.id
+    if key == "free":
+        last_time = await get_last_free_case(uid)
+        now = int(time.time())
+        if now - last_time < 86400:
+            remaining = 86400 - (now - last_time)
+            return await callback.answer(f"❌ Бесплатный кейс раз в 24ч.\nСледующая попытка через: {remaining//3600}ч {(remaining%3600)//60}мин", show_alert=True)
+        await set_last_free_case(uid, now)
+    if case["cost"] > 0 and uid != ADMIN_ID:
+        if await get_balance(uid) < case["cost"]: return await callback.answer("❌ Недостаточно звёзд!", show_alert=True)
+        await update_balance(uid, -case["cost"])
+    items = case["items"]
+    msg = await callback.message.edit_text("🎲 Крутим...")
+    await animate_case_opening(msg, items)
+    prize = random.choices(items, weights=case["weights"], k=1)[0]
+    if "⭐" in prize:
+        val = int(prize.split()[1])
+        await update_balance(uid, val)
+        await safe_edit_text(msg, f"✅ Выпало: {prize}!", reply_markup=main_kb())
+    elif prize == "💨 Пусто":
+        await safe_edit_text(msg, "💨 Пусто! Повезёт в следующий раз.", reply_markup=main_kb())
+    else:
+        await add_gift_to_inventory(uid, prize)
+        await safe_edit_text(msg, f"🎁 ОГО! Твой приз: {prize}\nОн отправлен в твой инвентарь!", reply_markup=main_kb())
+    await callback.answer()
+
+# --- ИНВЕНТАРЬ ---
+@router.callback_query(F.data == "menu_inventory")
+async def menu_inventory(callback: CallbackQuery):
+    if await check_banned_callback(callback): return
+    uid = callback.from_user.id
+    gifts = await get_inventory(uid)
+    if not gifts:
+        await callback.answer("🎒 Ваш инвентарь пуст.", show_alert=True)
+        return
+    buttons = [[InlineKeyboardButton(text=f"{g} — Вывести", callback_data=f"inv_withdraw_{g}")] for g in gifts]
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_main")])
+    await safe_edit_text(callback.message, "🎒 <b>Ваш инвентарь</b>\n\nВыберите подарок, чтобы вывести его.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("inv_withdraw_"))
+async def inventory_withdraw(callback: CallbackQuery, bot: Bot):
+    if await check_banned_callback(callback): return
+    gift_name = callback.data.replace("inv_withdraw_", "")
+    uid = callback.from_user.id
+    if gift_name not in await get_inventory(uid):
+        return await callback.answer("❌ Этого подарка нет в инвентаре!", show_alert=True)
+    has_withdrawn = await has_withdrawn_first_gift(uid)
+    if has_withdrawn and await get_total_deposited(uid) < 5:
+        return await callback.answer("❌ Для вывода следующих подарков необходимо пополнить баланс через Telegram Stars на сумму от 5 звёзд!", show_alert=True)
+    success = await send_gift_to_user(bot, uid, gift_name, "")
+    if success:
+        await remove_gift_from_inventory(uid, gift_name)
+        if not has_withdrawn:
+            await set_first_gift_withdrawn(uid)
+        await safe_edit_text(callback.message, f"✅ <b>Подарок {gift_name} успешно выведен!</b>", reply_markup=main_kb(), parse_mode="HTML")
+        await bot.send_message(ADMIN_ID, f"📤 <b>Вывод подарка из инвентаря</b>\n👤 <a href='tg://user?id={uid}'>{callback.from_user.first_name}</a>\n🎁 {gift_name}", parse_mode="HTML")
+    else:
+        await callback.answer("❌ Не удалось отправить подарок. Попробуйте позже.", show_alert=True)
+    await callback.answer()
+
+# --- ТОП ДОНАТЕРОВ ---
+@router.callback_query(F.data == "top_donators")
+async def show_top_donators(callback: CallbackQuery):
+    if await check_banned_callback(callback): return
+    top = await get_top_donators(10)
+    if not top: return await callback.answer("📊 Топ донатеров пока пуст.", show_alert=True)
+    text = "🏆 <b>Топ донатеров (по сумме пополнений через Stars):</b>\n\n"
+    for i, (user_id, amount) in enumerate(top, 1):
+        if user_id == ADMIN_ID: continue
+        try: name = (await callback.bot.get_chat(user_id)).first_name
+        except: name = f"ID {user_id}"
+        text += f"{i}. {name} — <b>{amount} ⭐</b>\n"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_main")]])
+    await safe_edit_text(callback.message, text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+# --- ПОПОЛНЕНИЕ (только Stars и покупка другу) ---
+@router.callback_query(F.data == "menu_pay")
+async def menu_pay(callback: CallbackQuery):
+    if await check_banned_callback(callback): return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐ Telegram Stars", callback_data="pay_stars")],
+        [InlineKeyboardButton(text="🎁 Купить другу", callback_data="pay_gift_friend")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_main")],
+    ])
+    await safe_edit_text(callback.message, "💳 Выберите способ пополнения:", reply_markup=kb)
+    await callback.answer()
+
+@router.callback_query(F.data == "pay_gift_friend")
+async def pay_gift_friend_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer(
+        "🎁 <b>Покупка звёзд для друга</b>\n\n"
+        "Введите <b>Telegram ID</b> друга, которому хотите подарить звёзды.\n"
+        "⚠️ Будьте внимательны: звёзды будут зачислены именно на этот ID!\n\n"
+        "💡 Чтобы узнать ID, перейдите в бота @userinfobot и нажмите «Узнать свой ID».",
+        parse_mode="HTML"
+    )
+    await state.set_state(GiftFriendState.waiting_for_friend_id)
+    await callback.answer()
+
+@router.message(GiftFriendState.waiting_for_friend_id)
+async def gift_friend_id(message: Message, state: FSMContext):
+    try: friend_id = int(message.text.strip())
+    except: return await message.answer("❌ ID должен быть целым числом.")
+    if friend_id <= 0: return await message.answer("❌ Некорректный ID.")
+    await state.update_data(friend_id=friend_id)
+    await message.answer("⭐ Введите количество звёзд (минимум 1):")
+    await state.set_state(GiftFriendState.waiting_for_amount)
+
+@router.message(GiftFriendState.waiting_for_amount)
+async def gift_friend_amount(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ Введите целое число.")
+    amount = int(message.text)
+    if amount <= 0: return await message.answer("❌ Количество должно быть положительным.")
+    data = await state.get_data()
+    await state.clear()
+    await message.answer_invoice(
+        title="Подарок другу",
+        description=f"Покупка {amount} звёзд для друга (ID {data['friend_id']})",
+        payload=f"gift_friend_{data['friend_id']}",
+        currency="XTR",
+        prices=[LabeledPrice(label="XTR", amount=amount)],
+    )
+
+@router.callback_query(F.data == "pay_stars")
+async def pay_stars_step(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("⭐ Сколько звёзд хотите купить?")
+    await state.set_state(PaymentState.waiting_for_stars_amount)
+    await callback.answer()
+
+@router.message(PaymentState.waiting_for_stars_amount)
+async def create_stars_invoice(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ Введите число!")
+    amount = int(message.text)
+    if amount <= 0: return await message.answer("❌ Количество должно быть больше нуля!")
+    await message.answer_invoice(
+        title="Пополнение баланса",
+        description="Покупка звёзд VladoCasino",
+        payload="topup_stars",
+        currency="XTR",
+        prices=[LabeledPrice(label="XTR", amount=amount)],
+    )
+    await state.clear()
+
+@router.pre_checkout_query()
+async def pre_checkout(query: PreCheckoutQuery): await query.answer(ok=True)
+
+@router.message(F.successful_payment)
+async def success_pay(message: Message):
+    amount = message.successful_payment.total_amount
+    uid = message.from_user.id
+    payload = message.successful_payment.invoice_payload
+    if payload.startswith("gift_friend_"):
+        friend_id = int(payload.replace("gift_friend_", ""))
+        await update_balance(friend_id, amount)
+        try: await message.bot.send_message(friend_id, f"🎁 Вам подарили {amount} ⭐!")
+        except: pass
+        await message.answer(f"✅ Вы подарили {amount} ⭐ пользователю ID {friend_id}!")
+    else:
+        await update_balance(uid, amount)
+        await add_deposit(uid, amount)
+        await message.answer(f"✅ Баланс звёзд пополнен на {amount} ⭐!\nТеперь вам доступен вывод подарков!")
+
+# --- ГЛАВНАЯ ФУНКЦИЯ ---
+async def main():
+    await init_db()
+    bot = Bot(token=TOKEN)
+    dp = Dispatcher()
+    dp.include_router(router)
+    logger.info("Бот запущен!")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
